@@ -31,7 +31,18 @@ class WorkflowyClient {
     priority?: number;
     layoutMode?: string;
   }) {
-    const response = await this.client.post("/nodes", params);
+    // Convert to API format (snake_case and nested data)
+    const apiParams: any = {
+      name: params.name,
+    };
+    if (params.parentId) apiParams.parent_id = params.parentId;
+    if (params.note) apiParams.note = params.note;
+    if (params.priority !== undefined) apiParams.priority = params.priority;
+    if (params.layoutMode) {
+      apiParams.data = { layoutMode: params.layoutMode };
+    }
+
+    const response = await this.client.post("/nodes", apiParams);
     return response.data;
   }
 
@@ -42,7 +53,7 @@ class WorkflowyClient {
 
   async listNodes(parentId?: string) {
     const response = await this.client.get("/nodes", {
-      params: parentId ? { parentId } : {},
+      params: parentId ? { parent_id: parentId } : {},
     });
     return response.data;
   }
@@ -56,7 +67,16 @@ class WorkflowyClient {
       layoutMode?: string;
     }
   ) {
-    const response = await this.client.post(`/nodes/${nodeId}`, params);
+    // Convert to API format (snake_case and nested data)
+    const apiParams: any = {};
+    if (params.name !== undefined) apiParams.name = params.name;
+    if (params.note !== undefined) apiParams.note = params.note;
+    if (params.priority !== undefined) apiParams.priority = params.priority;
+    if (params.layoutMode) {
+      apiParams.data = { layoutMode: params.layoutMode };
+    }
+
+    const response = await this.client.post(`/nodes/${nodeId}`, apiParams);
     return response.data;
   }
 
@@ -66,10 +86,12 @@ class WorkflowyClient {
   }
 
   async moveNode(nodeId: string, parentId: string, priority?: number) {
-    const response = await this.client.post(`/nodes/${nodeId}/move`, {
-      parentId,
-      priority,
-    });
+    const apiParams: any = {
+      parent_id: parentId,
+    };
+    if (priority !== undefined) apiParams.priority = priority;
+
+    const response = await this.client.post(`/nodes/${nodeId}/move`, apiParams);
     return response.data;
   }
 
