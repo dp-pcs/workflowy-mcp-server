@@ -8,10 +8,15 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
 
-// Workflowy API client
+// Workflowy API client with smart caching
 class WorkflowyClient {
   private client: AxiosInstance;
   private apiKey: string;
+  private nodeCache: {
+    data: any[] | null;
+    timestamp: number | null;
+    ttl: number;
+  };
 
   constructor(apiKey: string) {
     this.apiKey = apiKey;
@@ -22,6 +27,133 @@ class WorkflowyClient {
         "Content-Type": "application/json",
       },
     });
+
+    // Cache configuration: 90 seconds (safe margin under 1 req/min limit)
+    // Can be overridden with WORKFLOWY_CACHE_TTL env var
+    const cacheTTL = process.env.WORKFLOWY_CACHE_TTL
+      ? parseInt(process.env.WORKFLOWY_CACHE_TTL)
+      : 90000;
+
+    this.nodeCache = {
+      data: null,
+      timestamp: null,
+      ttl: cacheTTL,
+    };
+
+    console.error(`[Cache] Initialized with TTL: ${cacheTTL}ms (${cacheTTL / 1000}s)`);
+  }
+
+  // Get all nodes with smart caching (respects 1 req/min rate limit)
+  async getAllNodes(forceRefresh = false): Promise<any[]> {
+    const now = Date.now();
+    const cacheAge = this.nodeCache.timestamp ? now - this.nodeCache.timestamp : Infinity;
+
+    // Use cache if it's fresh enough and not forcing refresh
+    if (this.nodeCache.data && cacheAge < this.nodeCache.ttl && !forceRefresh) {
+      console.error(`[Cache] Using cached nodes (age: ${Math.round(cacheAge / 1000)}s)`);
+      return this.nodeCache.data;
+    }
+
+    // Try to refresh cache
+    try {
+      console.error("[Cache] Fetching fresh data from /nodes-export...");
+      const response = await this.client.get("/nodes-export");
+      const nodes = response.data.nodes || [];
+      this.nodeCache.data = nodes;
+      this.nodeCache.timestamp = now;
+      console.error(`[Cache] Loaded ${nodes.length} nodes`);
+      return nodes;
+    } catch (error: any) {
+      if (error.response?.status === 429) {
+        // Rate limited!
+        const retryAfter = error.response.data?.retry_after || 60;
+        if (this.nodeCache.data) {
+          // Use stale cache as fallback
+          console.error(
+            `[Cache] Rate limited (retry in ${retryAfter}s), using stale cache (age: ${Math.round(cacheAge / 1000)}s)`
+          );
+          return this.nodeCache.data;
+        }
+        throw new Error(
+          `Rate limited by Workflowy API. Please wait ${retryAfter} seconds before trying again.`
+        );
+      }
+      throw error;
+    }
+  }
+
+  // Invalidate cache when data changes
+  private invalidateCache() {
+    if (this.nodeCache.data) {
+      console.error("[Cache] Invalidating cache due to data modification");
+    }
+    this.nodeCache.data = null;
+    this.nodeCache.timestamp = null;
+  }
+
+  // Search nodes across entire hierarchy
+  async searchNodes(
+    query: string,
+    options?: {
+      searchName?: boolean;
+      searchNote?: boolean;
+      caseSensitive?: boolean;
+      maxResults?: number;
+    }
+  ): Promise<any[]> {
+    const {
+      searchName = true,
+      searchNote = true,
+      caseSensitive = false,
+      maxResults = 100,
+    } = options || {};
+
+    const allNodes = await this.getAllNodes();
+    const searchQuery = caseSensitive ? query : query.toLowerCase();
+
+    const results = allNodes.filter((node) => {
+      if (searchName && node.name) {
+        const name = caseSensitive ? node.name : node.name.toLowerCase();
+        if (name.includes(searchQuery)) return true;
+      }
+      if (searchNote && node.note) {
+        const note = caseSensitive ? node.note : node.note.toLowerCase();
+        if (note.includes(searchQuery)) return true;
+      }
+      return false;
+    });
+
+    return results.slice(0, maxResults);
+  }
+
+  // Get node with its children (uses cache for efficiency)
+  async getNodeWithChildren(nodeId: string, depth = 1): Promise<any> {
+    const allNodes = await this.getAllNodes();
+    const nodeMap = new Map(allNodes.map((n) => [n.id, n]));
+
+    const node = nodeMap.get(nodeId);
+    if (!node) {
+      throw new Error(`Node ${nodeId} not found`);
+    }
+
+    // Clone the node to avoid modifying cache
+    const result = { ...node };
+
+    // Add children if depth > 0
+    if (depth > 0) {
+      const children = allNodes.filter((n) => n.parent_id === nodeId);
+      result.children = children.map((child) => ({ ...child }));
+
+      // Recursively get children's children
+      if (depth > 1) {
+        for (const child of result.children) {
+          const childWithDescendants = await this.getNodeWithChildren(child.id, depth - 1);
+          Object.assign(child, childWithDescendants);
+        }
+      }
+    }
+
+    return result;
   }
 
   async createNode(params: {
@@ -43,6 +175,7 @@ class WorkflowyClient {
     }
 
     const response = await this.client.post("/nodes", apiParams);
+    this.invalidateCache();
     return response.data;
   }
 
@@ -77,11 +210,13 @@ class WorkflowyClient {
     }
 
     const response = await this.client.post(`/nodes/${nodeId}`, apiParams);
+    this.invalidateCache();
     return response.data;
   }
 
   async deleteNode(nodeId: string) {
     const response = await this.client.delete(`/nodes/${nodeId}`);
+    this.invalidateCache();
     return response.data;
   }
 
@@ -92,16 +227,19 @@ class WorkflowyClient {
     if (priority !== undefined) apiParams.priority = priority;
 
     const response = await this.client.post(`/nodes/${nodeId}/move`, apiParams);
+    this.invalidateCache();
     return response.data;
   }
 
   async completeNode(nodeId: string) {
     const response = await this.client.post(`/nodes/${nodeId}/complete`);
+    this.invalidateCache();
     return response.data;
   }
 
   async uncompleteNode(nodeId: string) {
     const response = await this.client.post(`/nodes/${nodeId}/uncomplete`);
+    this.invalidateCache();
     return response.data;
   }
 
@@ -200,6 +338,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "ID of the parent node (optional, defaults to root)",
             },
           },
+        },
+      },
+      {
+        name: "workflowy_search",
+        description:
+          "Search for nodes by text content across your ENTIRE Workflowy outline (all nodes including deeply nested children). Returns matching nodes with their IDs and parent relationships. Use this to find nodes anywhere in your hierarchy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Text to search for in node names and notes",
+            },
+            searchName: {
+              type: "boolean",
+              description: "Search in node names (default: true)",
+            },
+            searchNote: {
+              type: "boolean",
+              description: "Search in node notes (default: true)",
+            },
+            caseSensitive: {
+              type: "boolean",
+              description: "Case-sensitive search (default: false)",
+            },
+            maxResults: {
+              type: "number",
+              description: "Maximum number of results to return (default: 100)",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "workflowy_get_node_hierarchy",
+        description:
+          "Get a node with its children and descendants to see the full context and structure around it. Useful after finding a node via search to understand where it lives in your outline.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            nodeId: {
+              type: "string",
+              description: "ID of the node to retrieve with its hierarchy",
+            },
+            depth: {
+              type: "number",
+              description:
+                "How many levels of children to include (0 = just the node, 1 = node + direct children, 2 = node + children + grandchildren, etc.). Default: 1, Max: 5",
+              minimum: 0,
+              maximum: 5,
+            },
+          },
+          required: ["nodeId"],
         },
       },
       {
@@ -354,6 +545,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "workflowy_list_nodes": {
         const { parentId } = args as { parentId?: string };
         const result = await workflowy.listNodes(parentId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "workflowy_search": {
+        const { query, searchName, searchNote, caseSensitive, maxResults } = args as {
+          query: string;
+          searchName?: boolean;
+          searchNote?: boolean;
+          caseSensitive?: boolean;
+          maxResults?: number;
+        };
+        const results = await workflowy.searchNodes(query, {
+          searchName,
+          searchNote,
+          caseSensitive,
+          maxResults,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  query,
+                  resultCount: results.length,
+                  results,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "workflowy_get_node_hierarchy": {
+        const { nodeId, depth } = args as { nodeId: string; depth?: number };
+        const result = await workflowy.getNodeWithChildren(nodeId, depth || 1);
         return {
           content: [
             {
